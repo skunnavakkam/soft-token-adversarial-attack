@@ -19,7 +19,7 @@ def predict(
     for i in range(num_toks):
         toks = torch.tensor(tokens, dtype=torch.long)
         res, _tks, _spe, _attn = model.input_to_embed(toks)
-        total = torch.concat([first_tok_embedding.detach(), res], axis=1)
+        total = torch.concat([first_tok_embedding, res], axis=1)
 
         res = model(total, start_at_layer=0)[0]
         next_token = torch.argmax(res, axis=-1)[-1].item()
@@ -40,31 +40,41 @@ def loss_fn(logits, tokens, first_tok_embedding, gamma=0.2):
     logits = logits[0:-1, :]
 
     ce_loss = F.cross_entropy(logits, tokens)
-    l2_loss = l2(first_tok_embedding)
+    l2_loss = l2(logits)
 
     total = ce_loss + gamma * l2_loss
 
     return total
 
 
-def attack(text: str, model: str = "gpt2", soft_tokens=1, num_steps=1000):
+def attack(
+    text: str,
+    model_1: str = "gpt2",
+    model_2="qwen1.5-0.5b",
+    soft_tokens=1,
+    num_steps=1000,
+):
     if torch.backends.mps.is_available():
         device = "mps"
     else:
         device = "cpu"
 
-    model = HookedTransformer.from_pretrained(model, device=device)
+    model_1 = HookedTransformer.from_pretrained(model_1, device=device)
+    model_2 = HookedTransformer.from_pretrained(model_2, device=device)
 
-    toks = model.to_tokens(text)[:, 1:]
-    model_dim = model.cfg.d_model
+    model_1_toks = model_1.to_tokens(text)[:, 1:]
+    model_2_toks = model_2.to_tokens(text)[:, 1:]
+
+    model_1_dim = model_1.cfg.d_model
+    model_2_dim = model_2.cfg.d_model
     soft_token_embeddings = torch.randn(
-        size=(1, soft_tokens, model_dim),
-        dtype=torch.float32,
-        device=device,
-        requires_grad=True,
+        size=(1, soft_tokens, model_1_dim), dtype=torch.float32, device=device
+    )
+    translation_matrix = torch.randn(
+        size=(model_1_dim, model_2_dim), dtype=torch.float32, device=device
     )
 
-    optimizer = torch.optim.Adam([soft_token_embeddings], lr=0.2)
+    optimizer = torch.optim.Adam(model_1.parameters(), lr=0.001)
 
     last_corr = 0
     max_corr = 0
@@ -73,7 +83,7 @@ def attack(text: str, model: str = "gpt2", soft_tokens=1, num_steps=1000):
     for step in range(num_steps):
         optimizer.zero_grad()
 
-        logits = exec_model(model, soft_token_embeddings, toks)
+        logits = exec_model(model_1, soft_token_embeddings, toks)
         flattened_logits = logits.flatten(0, 1)[: last_corr + lookahead + soft_tokens]
         flattened_tokens = toks.flatten(0, 1)[: last_corr + lookahead]
 
@@ -85,7 +95,7 @@ def attack(text: str, model: str = "gpt2", soft_tokens=1, num_steps=1000):
         if step % 50 == 0:
             with torch.no_grad():
                 # now we run a prediction!
-                ps = predict(model, soft_token_embeddings, last_corr + lookahead)
+                ps = predict(model_1, soft_token_embeddings, last_corr + lookahead)
 
                 temp_corr = (
                     (
